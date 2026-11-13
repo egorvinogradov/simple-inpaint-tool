@@ -82,8 +82,8 @@ a{color:var(--acc)}
 <script>
 // ---- models: price per token in USD (from provider price lists), rough token counts per image ----
 const MODELS = [
-  {name:'Gemini 3.1 Flash Image (Nano Banana 2)', or:'google/gemini-3.1-flash-image', google:'gemini-3.1-flash-image-preview', inP:0.5e-6, outImg:60e-6, kind:'gemini', outTok:1290},
-  {name:'Gemini 3 Pro Image (Nano Banana Pro)', or:'google/gemini-3-pro-image', google:'gemini-3-pro-image-preview', inP:2e-6, outImg:120e-6, kind:'gemini', outTok:1120},
+  {name:'Gemini 3.1 Flash Image (Nano Banana 2)', or:'google/gemini-3.1-flash-image', google:'gemini-3.1-flash-image-preview', inP:0.5e-6, outImg:60e-6, kind:'gemini', tok:{'2K':1680,'4K':2520}},
+  {name:'Gemini 3 Pro Image (Nano Banana Pro)', or:'google/gemini-3-pro-image', google:'gemini-3-pro-image-preview', inP:2e-6, outImg:120e-6, kind:'gemini', tok:{'2K':1120,'4K':2000}},
   {name:'Gemini 2.5 Flash Image (cheapest)', or:'google/gemini-2.5-flash-image', google:'gemini-2.5-flash-image', inP:0.3e-6, outImg:30e-6, kind:'gemini', outTok:1290},
   {name:'GPT-5 Image Mini', or:'openai/gpt-5-image-mini', openai:'gpt-image-1-mini', inP:2.5e-6, outImg:8e-6, kind:'gpt'},
   {name:'GPT-5 Image', or:'openai/gpt-5-image', openai:'gpt-image-1', inP:10e-6, outImg:40e-6, kind:'gpt'},
@@ -103,11 +103,14 @@ function route(m){ const k = keys();
   if (m.openai && k.openai) return 'openai';
   return null; }
 
+// Output size for Gemini models that support it: 4K when the edited area is big, so the result is never stretched.
+const outSize = (m, box) => m.tok ? (Math.max(box.w, box.h) > 2600 ? '4K' : '2K') : null;
 function estimate(m){
   if (!orig) return null;
-  const w = photo.width, h = photo.height;
+  const box = hasMask() ? cropBox() : {w: orig.width, h: orig.height}, size = outSize(m, box);
+  const w = box.w, h = box.h;
   let inTok, outTok;
-  if (m.kind === 'gemini'){ inTok = 2*1290 + 100; outTok = m.outTok; }
+  if (m.kind === 'gemini'){ inTok = 2*1290 + 100; outTok = size ? m.tok[size] : m.outTok; }
   else { const s = 768/Math.min(w,h,768*99), tiles = Math.ceil(w*Math.min(1,s)/512)*Math.ceil(h*Math.min(1,s)/512);
          inTok = 2*(85+170*tiles) + 100; outTok = Math.abs(w/h-1) < .2 ? 5800 : 8700; } // GPT tokens calibrated: gpt-5-image-mini 1024² cost $0.051 (2026-11-13)
   return inTok*m.inP + outTok*m.outImg;
@@ -143,8 +146,9 @@ $('model').onchange = ()=>{ store.set('model', $('model').value); updateButton()
 
 // ---- load photo ----
 function loadSource(src){ // src: canvas or image
-  orig = document.createElement('canvas'); orig.width = src.naturalWidth || src.width; orig.height = src.naturalHeight || src.height;
-  orig.getContext('2d').drawImage(src,0,0);
+  const sw = src.naturalWidth || src.width, sh = src.naturalHeight || src.height, cap = Math.min(1, Math.sqrt(16e6/(sw*sh))); // iPhone canvas limit
+  orig = document.createElement('canvas'); orig.width = Math.round(sw*cap); orig.height = Math.round(sh*cap);
+  orig.getContext('2d').drawImage(src, 0, 0, orig.width, orig.height);
   const s = Math.min(1, MAXW/Math.max(orig.width, orig.height));
   photo.width = mask.width = Math.round(orig.width*s); photo.height = mask.height = Math.round(orig.height*s);
   pctx.drawImage(orig,0,0,photo.width,photo.height);
@@ -171,31 +175,59 @@ mask.addEventListener('pointerdown', e=>{ e.preventDefault(); mask.setPointerCap
   history.push(mctx.getImageData(0,0,mask.width,mask.height)); if (history.length > 30) history.shift();
   last = pos(e); stroke(last,last); });
 mask.addEventListener('pointermove', e=>{ if (!drawing) return; const p = pos(e); stroke(last,p); last = p; });
-['pointerup','pointercancel'].forEach(t=> mask.addEventListener(t, ()=> drawing = false));
-$('undo').onclick = ()=>{ const h = history.pop(); if (h) mctx.putImageData(h,0,0); };
-$('clear').onclick = ()=>{ history.push(mctx.getImageData(0,0,mask.width,mask.height)); mctx.clearRect(0,0,mask.width,mask.height); };
+['pointerup','pointercancel'].forEach(t=> mask.addEventListener(t, ()=>{ if (drawing){ drawing = false; updateButton(); } }));
+$('undo').onclick = ()=>{ const h = history.pop(); if (h) mctx.putImageData(h,0,0); updateButton(); };
+$('clear').onclick = ()=>{ history.push(mctx.getImageData(0,0,mask.width,mask.height)); mctx.clearRect(0,0,mask.width,mask.height); updateButton(); };
 
-function maskCanvas(w,h,{feather=0, transparentHole=false}={}){
+// Painted region of the original-pixel box `box`, drawn at w×h. Alpha = painted.
+function alphaMask(box, w, h, feather=0){
   const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d');
+  const s = mask.width / orig.width;   // orig px → mask-canvas px
   if (feather) x.filter = `blur(${feather}px)`;
-  x.drawImage(mask,0,0,w,h); x.filter = 'none';
-  if (transparentHole){ // OpenAI format: transparent = edit, opaque = keep
-    x.globalCompositeOperation = 'source-out'; x.fillStyle = '#000'; x.fillRect(0,0,w,h); return c; }
+  x.drawImage(mask, box.x*s, box.y*s, box.w*s, box.h*s, 0, 0, w, h);
+  return c;
+}
+// Same region as an image for the model: white = edit, black = keep (or transparent = edit for OpenAI).
+function maskCanvas(box, w, h, {transparentHole=false}={}){
+  const c = alphaMask(box, w, h), x = c.getContext('2d');
+  if (transparentHole){ x.globalCompositeOperation = 'source-out'; x.fillStyle = '#000'; x.fillRect(0,0,w,h); return c; }
   x.globalCompositeOperation = 'source-in'; x.fillStyle = '#fff'; x.fillRect(0,0,w,h);
   x.globalCompositeOperation = 'destination-over'; x.fillStyle = '#000'; x.fillRect(0,0,w,h);
   return c;
 }
 const hasMask = () => { const d = mctx.getImageData(0,0,mask.width,mask.height).data; for (let i=3;i<d.length;i+=16) if (d[i]) return true; return false; };
 
+// Box around the painted area (original pixels), padded for context, then grown to a ratio the models
+// support. The model works on just this region at high resolution, and its output maps back without stretching.
+const RATIOS = ['1:1','2:3','3:2','3:4','4:3','4:5','5:4','9:16','16:9','21:9'];
+function cropBox(){
+  const d = mctx.getImageData(0,0,mask.width,mask.height).data, MW = mask.width, MH = mask.height;
+  let x0 = MW, y0 = MH, x1 = -1, y1 = -1;
+  for (let y=0; y<MH; y++) for (let x=0; x<MW; x++) if (d[(y*MW+x)*4+3]) { if (x<x0) x0=x; if (x>x1) x1=x; if (y<y0) y0=y; if (y>y1) y1=y; }
+  const k = orig.width / MW, W = orig.width, H = orig.height;
+  const bx = x0*k, by = y0*k, bw = (x1-x0+1)*k, bh = (y1-y0+1)*k;
+  const pad = Math.max(48, 0.15*Math.max(bw,bh));
+  let w = Math.min(W, bw+2*pad), h = Math.min(H, bh+2*pad), best = null;
+  for (const r of RATIOS){ const [a,b] = r.split(':').map(Number), q = a/b;
+    const tw = Math.max(w, h*q), th = tw/q;
+    if (tw <= W+0.5 && th <= H+0.5 && (!best || tw*th < best.tw*best.th)) best = {r, tw, th}; }
+  if (best){ w = best.tw; h = best.th; }
+  const cx = bx+bw/2, cy = by+bh/2;
+  const x = Math.round(Math.min(Math.max(0, cx-w/2), W-w)), y = Math.round(Math.min(Math.max(0, cy-h/2), H-h));
+  return { x, y, w: Math.round(Math.min(w, W-x)), h: Math.round(Math.min(h, H-y)), ratio: best ? best.r : null };
+}
+const SEND = 2048;   // longest side of the crop sent to the model
+
 // ---- providers ----
 const INSTR = p => `You are given two images. Image 1 is a photo. Image 2 is a black-and-white mask of the same size: the WHITE area marks the region to edit. `+
   `Edit ONLY the white region of the photo: ${p}. Keep everything outside the white region exactly the same — same framing, aspect ratio, lighting, and perspective. `+
-  `Blend the edit naturally with the surroundings. Return only the full edited photo.`;
+  `Make the edges of the new content crisp, matching the photo's sharpness, and blend it naturally with the surroundings. Return only the full edited photo.`;
 
-async function callOpenRouter(m, photoUrl, maskUrl, p){
+async function callOpenRouter(m, photoUrl, maskUrl, p, ratio, size){
+  const image_config = {}; if (ratio) image_config.aspect_ratio = ratio; if (size) image_config.image_size = size;
   const r = await fetch('https://openrouter.ai/api/v1/chat/completions', { method:'POST',
     headers:{'Authorization':'Bearer '+keys().openrouter,'Content-Type':'application/json','X-Title':'Simple Inpaint'},
-    body: JSON.stringify({ model:m.or, modalities:['image','text'], usage:{include:true},
+    body: JSON.stringify({ model:m.or, modalities:['image','text'], usage:{include:true}, ...(m.kind==='gemini' ? {image_config} : {}),
       messages:[{role:'user', content:[{type:'text',text:INSTR(p)},{type:'image_url',image_url:{url:photoUrl}},{type:'image_url',image_url:{url:maskUrl}}]}] }) });
   const j = await r.json().catch(()=>({}));
   if (!r.ok || j.error) throw new Error((j.error && (j.error.message || JSON.stringify(j.error))) || ('HTTP '+r.status));
@@ -203,23 +235,24 @@ async function callOpenRouter(m, photoUrl, maskUrl, p){
   if (!url) throw new Error('The model returned no image.' + (msg?.content ? '\nIt said: ' + msg.content : ''));
   return { url, cost: j.usage?.cost };
 }
-async function callGoogle(m, photoUrl, maskUrl, p){
+async function callGoogle(m, photoUrl, maskUrl, p, ratio, size){
   const part = u => ({inline_data:{mime_type:u.slice(5,u.indexOf(';')), data:u.split(',')[1]}});
+  const imageConfig = {}; if (ratio) imageConfig.aspectRatio = ratio; if (size) imageConfig.imageSize = size;
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m.google}:generateContent`, { method:'POST',
     headers:{'x-goog-api-key':keys().google,'Content-Type':'application/json'},
-    body: JSON.stringify({ contents:[{parts:[{text:INSTR(p)}, part(photoUrl), part(maskUrl)]}], generationConfig:{responseModalities:['IMAGE','TEXT']} }) });
+    body: JSON.stringify({ contents:[{parts:[{text:INSTR(p)}, part(photoUrl), part(maskUrl)]}], generationConfig:{responseModalities:['IMAGE','TEXT'], imageConfig} }) });
   const j = await r.json().catch(()=>({}));
   if (!r.ok) throw new Error(j.error?.message || ('HTTP '+r.status));
   const parts = j.candidates?.[0]?.content?.parts || [], img = parts.find(x=>x.inlineData || x.inline_data);
   if (!img) throw new Error('The model returned no image.' + (parts[0]?.text ? '\nIt said: ' + parts[0].text : ''));
   const d = img.inlineData || img.inline_data; return { url:`data:${d.mimeType||d.mime_type};base64,${d.data}` };
 }
-async function callOpenAI(m, p){
+async function callOpenAI(m, crop, box, p){
   const toBlob = c => new Promise(res=> c.toBlob(res,'image/png'));
   const fd = new FormData();
   fd.append('model', m.openai); fd.append('prompt', p);
-  fd.append('image', await toBlob(photo), 'image.png');
-  fd.append('mask', await toBlob(maskCanvas(photo.width, photo.height, {transparentHole:true})), 'mask.png');
+  fd.append('image', await toBlob(crop), 'image.png');
+  fd.append('mask', await toBlob(maskCanvas(box, crop.width, crop.height, {transparentHole:true})), 'mask.png');
   const r = await fetch('https://api.openai.com/v1/images/edits', { method:'POST', headers:{'Authorization':'Bearer '+keys().openai}, body:fd });
   const j = await r.json().catch(()=>({}));
   if (!r.ok) throw new Error(j.error?.message || ('HTTP '+r.status));
@@ -235,26 +268,33 @@ $('go').onclick = async ()=>{
   const label = b.textContent; b.disabled = true;
   const t0 = Date.now(), tick = setInterval(()=> b.textContent = `Working… ${Math.round((Date.now()-t0)/1000)}s`, 500);
   try {
-    const photoUrl = photo.toDataURL('image/jpeg', .92), maskUrl = maskCanvas(photo.width, photo.height).toDataURL('image/png');
-    const res = r === 'openrouter' ? await callOpenRouter(m, photoUrl, maskUrl, p)
-              : r === 'google' ? await callGoogle(m, photoUrl, maskUrl, p) : await callOpenAI(m, p);
+    const box = cropBox(), s = Math.min(1, SEND/Math.max(box.w, box.h));
+    const crop = document.createElement('canvas'); crop.width = Math.round(box.w*s); crop.height = Math.round(box.h*s);
+    crop.getContext('2d').drawImage(orig, box.x, box.y, box.w, box.h, 0, 0, crop.width, crop.height);
+    const photoUrl = crop.toDataURL('image/jpeg', .92), maskUrl = maskCanvas(box, crop.width, crop.height).toDataURL('image/png');
+    const res = r === 'openrouter' ? await callOpenRouter(m, photoUrl, maskUrl, p, box.ratio, outSize(m, box))
+              : r === 'google' ? await callGoogle(m, photoUrl, maskUrl, p, box.ratio, outSize(m, box)) : await callOpenAI(m, crop, box, p);
     const img = await new Promise((ok,no)=>{ const i = new Image(); i.onload = ()=>ok(i); i.onerror = ()=>no(new Error('Could not decode the result image.')); i.src = res.url; });
-    // compose at full original resolution
-    const W = orig.width, H = orig.height, out = document.createElement('canvas'); out.width = W; out.height = H;
-    const o = out.getContext('2d');
-    {
-      const gen = document.createElement('canvas'); gen.width = W; gen.height = H; const g = gen.getContext('2d');
-      g.drawImage(img,0,0,W,H);
-      g.globalCompositeOperation = 'destination-in';
-      const feather = Math.max(2, Math.round(Math.max(W,H)/250));
-      const mk = document.createElement('canvas'); mk.width = W; mk.height = H; const mx = mk.getContext('2d');
-      mx.filter = `blur(${feather}px)`; mx.drawImage(mask,0,0,W,H);
-      g.drawImage(mk,0,0);
-      o.drawImage(orig,0,0); o.drawImage(gen,0,0);
-    }
+    // paste only the painted part of the result back into the original, at full resolution, with a thin soft edge
+    const gen = document.createElement('canvas'); gen.width = box.w; gen.height = box.h; const g = gen.getContext('2d');
+    g.imageSmoothingQuality = 'high'; g.drawImage(img, 0, 0, box.w, box.h);
+    // Where the AI pixel is almost the same as the original (e.g. background it re-drew with a slight tint), keep the original.
+    const keep = document.createElement('canvas'); keep.width = box.w; keep.height = box.h; const kx = keep.getContext('2d');
+    const gd = g.getImageData(0, 0, box.w, box.h), od = orig.getContext('2d').getImageData(box.x, box.y, box.w, box.h), kd = kx.createImageData(box.w, box.h);
+    for (let i = 0; i < gd.data.length; i += 4){
+      const d = Math.max(Math.abs(gd.data[i]-od.data[i]), Math.abs(gd.data[i+1]-od.data[i+1]), Math.abs(gd.data[i+2]-od.data[i+2]));
+      kd.data[i+3] = Math.max(0, Math.min(255, (d-12)*16)); }    // diff ≤12 → original, ≥28 → AI
+    kx.putImageData(kd, 0, 0);
+    const keepSoft = document.createElement('canvas'); keepSoft.width = box.w; keepSoft.height = box.h;
+    const ks = keepSoft.getContext('2d'); ks.filter = 'blur(1px)'; ks.drawImage(keep, 0, 0);
+    g.globalCompositeOperation = 'destination-in';
+    g.drawImage(alphaMask(box, box.w, box.h, Math.max(1, Math.round(Math.max(box.w, box.h)/1000))), 0, 0);
+    g.drawImage(keepSoft, 0, 0);
+    const out = document.createElement('canvas'); out.width = orig.width; out.height = orig.height;
+    const o = out.getContext('2d'); o.drawImage(orig, 0, 0); o.drawImage(gen, box.x, box.y);
     resultCanvas = out;
     $('out').src = out.toDataURL('image/jpeg', .95);
-    $('cost').textContent = `${m.name} via ${r}. Took ${Math.round((Date.now()-t0)/1000)}s.` + (res.cost != null ? ` Actual cost: $${(+res.cost).toFixed(4)}.` : '');
+    $('cost').textContent = `${m.name} via ${r}. Edited area ${box.w}×${box.h}, sent ${crop.width}×${crop.height}, got back ${img.naturalWidth}×${img.naturalHeight}. Took ${Math.round((Date.now()-t0)/1000)}s.` + (res.cost != null ? ` Actual cost: $${(+res.cost).toFixed(4)}.` : '');
     $('result').hidden = false; $('result').scrollIntoView({behavior:'smooth'});
   } catch(e){ $('err').textContent = 'Error: ' + e.message; }
   finally { clearInterval(tick); b.textContent = label; b.disabled = false; updateButton(); }
