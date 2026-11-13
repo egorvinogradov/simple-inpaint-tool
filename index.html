@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Simple Inpaint</title>
+<style>
+:root{--bg:#fff;--fg:#111;--mut:#666;--line:#ddd;--acc:#2563eb;--card:#f6f6f7}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--mut:#999;--line:#333;--acc:#4f8cff;--card:#1b1b1d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,sans-serif}
+main{max-width:760px;margin:auto;padding:12px 16px 40px}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+h1{font-size:20px;margin:0}
+button,select,input,textarea{font:inherit;color:inherit}
+button{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:10px 14px;cursor:pointer}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;width:100%;font-weight:600;padding:14px}
+button:disabled{opacity:.5;cursor:default}
+select,textarea,input[type=password],input[type=text]{width:100%;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:10px}
+textarea{min-height:70px;resize:vertical}
+.drop{display:block;border:2px dashed var(--line);border-radius:14px;padding:40px 16px;text-align:center;color:var(--mut);cursor:pointer}
+.stage{position:relative;touch-action:none;user-select:none;-webkit-user-select:none;line-height:0}
+.stage canvas{width:100%;height:auto;border-radius:10px}
+#mask{position:absolute;inset:0;opacity:.5}
+.row{display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap}
+.row label{color:var(--mut);font-size:14px}
+input[type=range]{flex:1;min-width:120px}
+.field{margin:12px 0}
+.mut{color:var(--mut);font-size:14px}
+.err{color:#e5484d;font-size:14px;white-space:pre-wrap}
+#result img{width:100%;border-radius:10px}
+#drawer{position:fixed;inset:0;background:#0007;display:none}
+#drawer.open{display:block}
+#drawer .panel{position:absolute;right:0;top:0;bottom:0;width:min(420px,100%);background:var(--bg);padding:16px;overflow:auto}
+#drawer h2{margin:0 0 12px;font-size:18px;display:flex;justify-content:space-between;align-items:center}
+a{color:var(--acc)}
+</style>
+</head>
+<body>
+<main>
+  <header><h1>Simple Inpaint</h1><button id="openSettings">⚙︎ Keys</button></header>
+
+  <label class="drop" id="drop">Tap to choose a photo (or drop it here)
+    <input type="file" id="file" accept="image/*" hidden>
+  </label>
+
+  <section id="editor" hidden>
+    <p class="mut">Paint over the part you want to change.</p>
+    <div class="stage"><canvas id="photo"></canvas><canvas id="mask"></canvas></div>
+    <div class="row">
+      <label for="brush">Brush</label><input type="range" id="brush" min="5" max="150" value="40">
+      <button id="undo">Undo</button><button id="clear">Clear</button><button id="newPhoto">New photo</button>
+    </div>
+    <div class="field"><textarea id="prompt" placeholder="What should appear in the painted area? e.g. “a red vintage bicycle”"></textarea></div>
+    <div class="field"><select id="model"></select></div>
+    <p class="mut">Only the painted area changes. Every pixel outside it is copied from your original photo.</p>
+    <button class="primary" id="go">Generate</button>
+    <p class="err" id="err"></p>
+  </section>
+
+  <section id="result" hidden>
+    <h2 style="font-size:18px">Result</h2>
+    <img id="out" alt="result">
+    <p class="mut" id="cost"></p>
+    <div class="row"><button id="download">Download</button><button id="reuse">Keep editing this result</button></div>
+  </section>
+</main>
+
+<div id="drawer"><div class="panel">
+  <h2>API keys <button id="closeSettings">✕</button></h2>
+  <p class="mut">Keys stay in this browser (localStorage) and go straight to the provider. Nothing passes through any server of ours.</p>
+  <div class="field"><label>OpenRouter — unlocks all models<br><input type="password" id="k_openrouter" placeholder="sk-or-..."></label>
+    <span class="mut"><a href="https://openrouter.ai/settings/keys" target="_blank">get a key</a></span></div>
+  <div class="field"><label>Google AI Studio — unlocks Gemini models<br><input type="password" id="k_google" placeholder="AIza..."></label>
+    <span class="mut"><a href="https://aistudio.google.com/apikey" target="_blank">get a key</a></span></div>
+  <div class="field"><label>OpenAI — unlocks GPT image models<br><input type="password" id="k_openai" placeholder="sk-..."></label>
+    <span class="mut"><a href="https://platform.openai.com/api-keys" target="_blank">get a key</a></span></div>
+  <p class="mut">If you have several keys, OpenRouter is used first.</p>
+</div></div>
+
+<script>
+// ---- models: price per token in USD (from provider price lists), rough token counts per image ----
+const MODELS = [
+  {name:'Gemini 3.1 Flash Image (Nano Banana 2)', or:'google/gemini-3.1-flash-image', google:'gemini-3.1-flash-image-preview', inP:0.5e-6, outImg:60e-6, kind:'gemini', outTok:1290},
+  {name:'Gemini 3 Pro Image (Nano Banana Pro)', or:'google/gemini-3-pro-image', google:'gemini-3-pro-image-preview', inP:2e-6, outImg:120e-6, kind:'gemini', outTok:1120},
+  {name:'Gemini 2.5 Flash Image (cheapest)', or:'google/gemini-2.5-flash-image', google:'gemini-2.5-flash-image', inP:0.3e-6, outImg:30e-6, kind:'gemini', outTok:1290},
+  {name:'GPT-5 Image Mini', or:'openai/gpt-5-image-mini', openai:'gpt-image-1-mini', inP:2.5e-6, outImg:8e-6, kind:'gpt'},
+  {name:'GPT-5 Image', or:'openai/gpt-5-image', openai:'gpt-image-1', inP:10e-6, outImg:40e-6, kind:'gpt'},
+  {name:'GPT-5.4 Image 2', or:'openai/gpt-5.4-image-2', inP:8e-6, outImg:30e-6, kind:'gpt'},
+];
+const $ = id => document.getElementById(id);
+const store = { get:k=>{try{return localStorage.getItem(k)||''}catch{return ''}}, set:(k,v)=>{try{localStorage.setItem(k,v)}catch{}} };
+const keys = () => ({openrouter:store.get('k_openrouter').trim(), google:store.get('k_google').trim(), openai:store.get('k_openai').trim()});
+const MAXW = 1536;           // working resolution sent to the model
+let orig = null;             // full-resolution original (canvas)
+const photo = $('photo'), mask = $('mask'), pctx = photo.getContext('2d'), mctx = mask.getContext('2d');
+let history = [], resultCanvas = null;
+
+function route(m){ const k = keys();
+  if (k.openrouter) return 'openrouter';
+  if (m.google && k.google) return 'google';
+  if (m.openai && k.openai) return 'openai';
+  return null; }
+
+function estimate(m){
+  if (!orig) return null;
+  const w = photo.width, h = photo.height;
+  let inTok, outTok;
+  if (m.kind === 'gemini'){ inTok = 2*1290 + 100; outTok = m.outTok; }
+  else { const s = 768/Math.min(w,h,768*99), tiles = Math.ceil(w*Math.min(1,s)/512)*Math.ceil(h*Math.min(1,s)/512);
+         inTok = 2*(85+170*tiles) + 100; outTok = Math.abs(w/h-1) < .2 ? 4160 : 6240; }
+  return inTok*m.inP + outTok*m.outImg;
+}
+const money = v => v < 0.01 ? '<$0.01' : '$' + v.toFixed(v < 0.1 ? 3 : 2);
+
+function renderModels(){
+  const sel = $('model'), cur = sel.value || store.get('model');
+  sel.innerHTML = '';
+  MODELS.forEach((m,i)=>{ const r = route(m), o = document.createElement('option');
+    o.value = i; o.disabled = !r;
+    o.textContent = m.name + (r ? '' : '  🔒 add a key') ;
+    sel.appendChild(o); });
+  const firstOk = MODELS.findIndex(m=>route(m));
+  sel.value = (cur !== '' && route(MODELS[cur])) ? cur : (firstOk >= 0 ? firstOk : 0);
+  updateButton();
+}
+function updateButton(){
+  const m = MODELS[$('model').value], r = m && route(m), b = $('go');
+  if (!r){ b.disabled = true; b.textContent = 'Add an API key (⚙︎ Keys) to generate'; return; }
+  b.disabled = false;
+  const e = estimate(m);
+  b.textContent = 'Generate' + (e != null ? ' · ≈ ' + money(e) : '') + ' via ' + {openrouter:'OpenRouter',google:'Google',openai:'OpenAI'}[r];
+}
+
+// ---- settings drawer ----
+['openrouter','google','openai'].forEach(p=>{ const el = $('k_'+p); el.value = store.get('k_'+p);
+  el.addEventListener('input', ()=>{ store.set('k_'+p, el.value); renderModels(); }); });
+$('openSettings').onclick = ()=> $('drawer').classList.add('open');
+$('closeSettings').onclick = ()=> $('drawer').classList.remove('open');
+$('drawer').onclick = e => { if (e.target.id === 'drawer') $('drawer').classList.remove('open'); };
+$('model').onchange = ()=>{ store.set('model', $('model').value); updateButton(); };
+
+// ---- load photo ----
+function loadSource(src){ // src: canvas or image
+  orig = document.createElement('canvas'); orig.width = src.naturalWidth || src.width; orig.height = src.naturalHeight || src.height;
+  orig.getContext('2d').drawImage(src,0,0);
+  const s = Math.min(1, MAXW/Math.max(orig.width, orig.height));
+  photo.width = mask.width = Math.round(orig.width*s); photo.height = mask.height = Math.round(orig.height*s);
+  pctx.drawImage(orig,0,0,photo.width,photo.height);
+  mctx.clearRect(0,0,mask.width,mask.height); history = [];
+  $('drop').hidden = true; $('editor').hidden = false; $('err').textContent = '';
+  updateButton();
+}
+function loadFile(f){ if (!f) return; const img = new Image();
+  img.onload = ()=>{ loadSource(img); URL.revokeObjectURL(img.src); };
+  img.onerror = ()=> alert('Could not read this image.');
+  img.src = URL.createObjectURL(f); }
+$('file').onchange = e => loadFile(e.target.files[0]);
+$('drop').ondragover = e => e.preventDefault();
+$('drop').ondrop = e => { e.preventDefault(); loadFile(e.dataTransfer.files[0]); };
+$('newPhoto').onclick = ()=>{ $('file').value=''; $('file').click(); };
+
+// ---- painting ----
+let drawing = false, last = null;
+const pos = e => { const r = mask.getBoundingClientRect(); return [(e.clientX-r.left)*mask.width/r.width, (e.clientY-r.top)*mask.height/r.height]; };
+const brush = () => $('brush').value * mask.width / mask.getBoundingClientRect().width;
+function stroke(a,b){ mctx.strokeStyle = mctx.fillStyle = '#ff2d55'; mctx.lineWidth = brush(); mctx.lineCap = mctx.lineJoin = 'round';
+  mctx.beginPath(); mctx.moveTo(...a); mctx.lineTo(...b); mctx.stroke(); }
+mask.addEventListener('pointerdown', e=>{ e.preventDefault(); mask.setPointerCapture(e.pointerId); drawing = true;
+  history.push(mctx.getImageData(0,0,mask.width,mask.height)); if (history.length > 30) history.shift();
+  last = pos(e); stroke(last,last); });
+mask.addEventListener('pointermove', e=>{ if (!drawing) return; const p = pos(e); stroke(last,p); last = p; });
+['pointerup','pointercancel'].forEach(t=> mask.addEventListener(t, ()=> drawing = false));
+$('undo').onclick = ()=>{ const h = history.pop(); if (h) mctx.putImageData(h,0,0); };
+$('clear').onclick = ()=>{ history.push(mctx.getImageData(0,0,mask.width,mask.height)); mctx.clearRect(0,0,mask.width,mask.height); };
+
+function maskCanvas(w,h,{feather=0, transparentHole=false}={}){
+  const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d');
+  if (feather) x.filter = `blur(${feather}px)`;
+  x.drawImage(mask,0,0,w,h); x.filter = 'none';
+  if (transparentHole){ // OpenAI format: transparent = edit, opaque = keep
+    x.globalCompositeOperation = 'source-out'; x.fillStyle = '#000'; x.fillRect(0,0,w,h); return c; }
+  x.globalCompositeOperation = 'source-in'; x.fillStyle = '#fff'; x.fillRect(0,0,w,h);
+  x.globalCompositeOperation = 'destination-over'; x.fillStyle = '#000'; x.fillRect(0,0,w,h);
+  return c;
+}
+const hasMask = () => { const d = mctx.getImageData(0,0,mask.width,mask.height).data; for (let i=3;i<d.length;i+=16) if (d[i]) return true; return false; };
+
+// ---- providers ----
+const INSTR = p => `You are given two images. Image 1 is a photo. Image 2 is a black-and-white mask of the same size: the WHITE area marks the region to edit. `+
+  `Edit ONLY the white region of the photo: ${p}. Keep everything outside the white region exactly the same — same framing, aspect ratio, lighting, and perspective. `+
+  `Blend the edit naturally with the surroundings. Return only the full edited photo.`;
+
+async function callOpenRouter(m, photoUrl, maskUrl, p){
+  const r = await fetch('https://openrouter.ai/api/v1/chat/completions', { method:'POST',
+    headers:{'Authorization':'Bearer '+keys().openrouter,'Content-Type':'application/json','X-Title':'Simple Inpaint'},
+    body: JSON.stringify({ model:m.or, modalities:['image','text'], usage:{include:true},
+      messages:[{role:'user', content:[{type:'text',text:INSTR(p)},{type:'image_url',image_url:{url:photoUrl}},{type:'image_url',image_url:{url:maskUrl}}]}] }) });
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok || j.error) throw new Error((j.error && (j.error.message || JSON.stringify(j.error))) || ('HTTP '+r.status));
+  const msg = j.choices?.[0]?.message, url = msg?.images?.[0]?.image_url?.url;
+  if (!url) throw new Error('The model returned no image.' + (msg?.content ? '\nIt said: ' + msg.content : ''));
+  return { url, cost: j.usage?.cost };
+}
+async function callGoogle(m, photoUrl, maskUrl, p){
+  const part = u => ({inline_data:{mime_type:u.slice(5,u.indexOf(';')), data:u.split(',')[1]}});
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m.google}:generateContent`, { method:'POST',
+    headers:{'x-goog-api-key':keys().google,'Content-Type':'application/json'},
+    body: JSON.stringify({ contents:[{parts:[{text:INSTR(p)}, part(photoUrl), part(maskUrl)]}], generationConfig:{responseModalities:['IMAGE','TEXT']} }) });
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(j.error?.message || ('HTTP '+r.status));
+  const parts = j.candidates?.[0]?.content?.parts || [], img = parts.find(x=>x.inlineData || x.inline_data);
+  if (!img) throw new Error('The model returned no image.' + (parts[0]?.text ? '\nIt said: ' + parts[0].text : ''));
+  const d = img.inlineData || img.inline_data; return { url:`data:${d.mimeType||d.mime_type};base64,${d.data}` };
+}
+async function callOpenAI(m, p){
+  const toBlob = c => new Promise(res=> c.toBlob(res,'image/png'));
+  const fd = new FormData();
+  fd.append('model', m.openai); fd.append('prompt', p);
+  fd.append('image', await toBlob(photo), 'image.png');
+  fd.append('mask', await toBlob(maskCanvas(photo.width, photo.height, {transparentHole:true})), 'mask.png');
+  const r = await fetch('https://api.openai.com/v1/images/edits', { method:'POST', headers:{'Authorization':'Bearer '+keys().openai}, body:fd });
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(j.error?.message || ('HTTP '+r.status));
+  return { url:'data:image/png;base64,' + j.data[0].b64_json };
+}
+
+// ---- generate ----
+$('go').onclick = async ()=>{
+  const m = MODELS[$('model').value], r = route(m), p = $('prompt').value.trim(), b = $('go');
+  $('err').textContent = '';
+  if (!hasMask()) return $('err').textContent = 'Paint the area you want to change first.';
+  if (!p) return $('err').textContent = 'Type what should appear in the painted area.';
+  const label = b.textContent; b.disabled = true;
+  const t0 = Date.now(), tick = setInterval(()=> b.textContent = `Working… ${Math.round((Date.now()-t0)/1000)}s`, 500);
+  try {
+    const photoUrl = photo.toDataURL('image/jpeg', .92), maskUrl = maskCanvas(photo.width, photo.height).toDataURL('image/png');
+    const res = r === 'openrouter' ? await callOpenRouter(m, photoUrl, maskUrl, p)
+              : r === 'google' ? await callGoogle(m, photoUrl, maskUrl, p) : await callOpenAI(m, p);
+    const img = await new Promise((ok,no)=>{ const i = new Image(); i.onload = ()=>ok(i); i.onerror = ()=>no(new Error('Could not decode the result image.')); i.src = res.url; });
+    // compose at full original resolution
+    const W = orig.width, H = orig.height, out = document.createElement('canvas'); out.width = W; out.height = H;
+    const o = out.getContext('2d');
+    {
+      const gen = document.createElement('canvas'); gen.width = W; gen.height = H; const g = gen.getContext('2d');
+      g.drawImage(img,0,0,W,H);
+      g.globalCompositeOperation = 'destination-in';
+      const feather = Math.max(2, Math.round(Math.max(W,H)/250));
+      const mk = document.createElement('canvas'); mk.width = W; mk.height = H; const mx = mk.getContext('2d');
+      mx.filter = `blur(${feather}px)`; mx.drawImage(mask,0,0,W,H);
+      g.drawImage(mk,0,0);
+      o.drawImage(orig,0,0); o.drawImage(gen,0,0);
+    }
+    resultCanvas = out;
+    $('out').src = out.toDataURL('image/jpeg', .95);
+    $('cost').textContent = `${m.name} via ${r}. Took ${Math.round((Date.now()-t0)/1000)}s.` + (res.cost != null ? ` Actual cost: $${(+res.cost).toFixed(4)}.` : '');
+    $('result').hidden = false; $('result').scrollIntoView({behavior:'smooth'});
+  } catch(e){ $('err').textContent = 'Error: ' + e.message; }
+  finally { clearInterval(tick); b.textContent = label; b.disabled = false; updateButton(); }
+};
+$('download').onclick = ()=> resultCanvas.toBlob(bl=>{ const a = document.createElement('a');
+  a.href = URL.createObjectURL(bl); a.download = 'inpaint-' + Date.now() + '.jpg'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 5000); }, 'image/jpeg', .95);
+$('reuse').onclick = ()=>{ loadSource(resultCanvas); $('result').hidden = true; window.scrollTo({top:0,behavior:'smooth'}); };
+
+renderModels();
+</script>
+</body>
+</html>
